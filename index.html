@@ -13,7 +13,7 @@
   :root {
     color-scheme: dark;
     --bg: #0a0a0a; --panel: #141414; --text: #e6e1d9; --muted: #8a8580; --border: #2a2826;
-    --accent: #d97757;
+    --accent: #d97757; --c-main: #d97757; --c-agent: #6fc3a0; --c-money: #5fd068;
     --c-input: #7f98b0; --c-output: #d97757; --c-cwrite: #c9a86a; --c-cread: #5a5650;
   }
   * { box-sizing: border-box; }
@@ -47,6 +47,15 @@
   .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; }
   .empty { color: var(--muted); }
   .table-scroll { overflow-x: auto; }
+  .tabs { display: flex; gap: 4px; padding: 12px 20px 0; border-bottom: 1px solid var(--border); }
+  .tabs button { border: 1px solid var(--border); border-bottom: none; border-radius: 6px 6px 0 0;
+                 background: var(--bg); color: var(--muted); padding: 7px 16px; margin-bottom: -1px; }
+  .tabs button.active { background: var(--panel); color: var(--accent); border-color: var(--border); }
+  .meta b.money, b.money { color: var(--c-money); }
+  .tab { display: grid; gap: 16px; }
+  .tab[hidden] { display: none; }
+  .toolbar { display: flex; gap: 12px; align-items: center; margin-bottom: 10px; color: var(--muted); }
+  .toolbar select { padding: 4px 8px; }
 </style>
 </head>
 <body>
@@ -62,10 +71,29 @@
   <button id="reload" title="Volver a leer los transcripts">Recargar</button>
   <span id="status"></span>
 </header>
+<nav class="tabs">
+  <button class="active" data-tab="session">Sesión</button>
+  <button data-tab="days">En el tiempo</button>
+</nav>
 <main>
-  <div class="card meta" id="meta"><span class="empty">Cargando sesiones…</span></div>
-  <div class="card"><div class="chart-wrap"><canvas id="chart"></canvas></div></div>
-  <div class="card table-scroll" id="detail"></div>
+  <section class="tab" id="tab-session">
+    <div class="card meta" id="meta"><span class="empty">Cargando sesiones…</span></div>
+    <div class="card"><div class="chart-wrap"><canvas id="chart"></canvas></div></div>
+    <div class="card table-scroll" id="detail"></div>
+  </section>
+  <section class="tab" id="tab-days" hidden>
+    <div class="card meta" id="daysMeta"><span class="empty">Sin datos todavía…</span></div>
+    <div class="card">
+      <div class="toolbar">Agrupar por
+        <select id="groupBy"><option value="type">Tipo de token</option><option value="model">Modelo</option></select>
+        Eje
+        <select id="metric"><option value="tokens">Tokens</option><option value="cost">Coste (€)</option></select>
+        <span>(respeta el filtro de Proyecto; usa todas las sesiones, no solo la seleccionada)</span>
+      </div>
+      <div class="chart-wrap"><canvas id="dayChart"></canvas></div>
+    </div>
+  </section>
+  <section class="card table-scroll" id="prices"></section>
 </main>
 
 <script src="vendor/chart.umd.min.js"></script>
@@ -95,9 +123,34 @@ async function loadConfig() {
       PROJECT_NAMES = Object.fromEntries(Object.entries(cfg.names).map(([k, v]) => [toClaudeDir(k), v]));
   } catch { /* sin config.json o JSON invalido: valores por defecto */ }
 }
-const CACHE_PREFIX = 'cm1:';                      // cache de resumenes en localStorage
+const CACHE_PREFIX = 'cm3:';                     // cache de resumenes en localStorage
+
+// ---------- Tarifas (datos fijos) ----------
+// USD por millon de tokens. Fuente: https://platform.claude.com/docs/en/about-claude/pricing
+// (consultada el 2026-11-19). Orden: entrada, escritura cache 5 min, escritura cache 1 h, lectura cache, salida.
+// Para actualizarlas basta con editar esta tabla: el coste se calcula al vuelo, no se guarda en cache.
+const P = (i, w5, w1, read, out) => ({ in: i, w5, w1, read, out });
+const PRICES = {
+  'fable-5-2': P(8, 10, 16, 0.20, 40),       'mythos-5-2': P(8, 10, 16, 0.20, 40),
+  'fable-5-1': P(10, 12.5, 20, 0.25, 50),    'mythos-5-1': P(10, 12.5, 20, 0.25, 50),
+  'fable-5':   P(10, 12.5, 20, 1, 50),       'mythos-5':   P(10, 12.5, 20, 1, 50),
+  'opus-5-5':  P(4, 5, 8, 0.20, 20),
+  'opus-5':    P(5, 6.25, 10, 0.50, 25),
+  'opus-4-8':  P(5, 6.25, 10, 0.50, 25),     'opus-4-7':  P(5, 6.25, 10, 0.50, 25),
+  'opus-4-6':  P(5, 6.25, 10, 0.50, 25),     'opus-4-5':  P(5, 6.25, 10, 0.50, 25),
+  'opus-4-1':  P(15, 18.75, 30, 1.50, 75),   'opus-4':    P(15, 18.75, 30, 1.50, 75),
+  'sonnet-5-5': P(2, 2.5, 4, 0.10, 10),
+  'sonnet-5':   P(2, 2.5, 4, 0.20, 10),
+  'sonnet-4-6': P(3, 3.75, 6, 0.30, 15),     'sonnet-4-5': P(3, 3.75, 6, 0.30, 15),
+  'sonnet-4':   P(3, 3.75, 6, 0.30, 15),
+  'haiku-5-5':       P(0.10, 0.125, 0.20, 0.01, 0.50),   // prompts de hasta 100.000 tokens
+  'haiku-5-5#long':  P(0.50, 0.625, 1, 0.05, 2.50),      // prompts de mas de 100.000 tokens
+  'haiku-4-5':  P(1, 1.25, 2, 0.10, 5),
+};
+const USD_PER_EUR = 1.0992;                      // tipo de referencia BCE del 2026-11-19
 
 const TOKEN_KEYS = ['input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens'];
+const USAGE_KEYS = [...TOKEN_KEYS, 'cw1h'];      // cw1h: parte de la escritura de cache que fue de 1 hora
 const TYPES = [
   { key: 'input_tokens', label: 'Entrada', color: '--c-input' },
   { key: 'output_tokens', label: 'Salida', color: '--c-output' },
@@ -115,7 +168,61 @@ const fmtDate = s => s ? new Date(s).toLocaleString('es-ES', { dateStyle: 'short
 const trunc = (s, n) => s && s.length > n ? s.slice(0, n - 1) + '…' : (s || '');
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const prettyProject = p => PROJECT_NAMES[p.toLowerCase()] || p.replace(/^[a-z]--DESARROLLO--/i, '');
-const emptyUsage = () => Object.fromEntries(TOKEN_KEYS.map(k => [k, 0]));
+const emptyUsage = () => Object.fromEntries(USAGE_KEYS.map(k => [k, 0]));
+
+// ---------- Costes ----------
+const baseModel = k => k.split('#')[0];                    // 'x#long' -> 'x'
+const priceKey = (model, u) => {                           // Haiku 5.5 cambia de tarifa por encima de 100k de prompt
+  const prompt = (+u.input_tokens || 0) + (+u.cache_creation_input_tokens || 0) + (+u.cache_read_input_tokens || 0);
+  return /haiku-5-5/.test(model) && prompt > 100000 ? model + '#long' : model;
+};
+const cleanModel = key => key.replace(/^claude-/, '').replace(/\[.*?\]/, '').replace(/-\d{8}(?=#|$)/, '');
+const officialPrice = key => PRICES[cleanModel(key)];
+// Modelos sin tarifa publicada: se usa una tarifa estimada, el promedio de las tarifas normales
+// de los modelos con precio que aparecen en los datos (ver computeEstimate)
+let ESTIMATE = null;
+const isEstimated = key => !officialPrice(key);
+const priceFor = key => officialPrice(key) || ESTIMATE;
+function computeEstimate(modelKeys) {
+  let base = [...new Set(modelKeys.map(k => cleanModel(baseModel(k))))].filter(k => PRICES[k]);
+  if (!base.length) base = Object.keys(PRICES).filter(k => !k.includes('#'));
+  const avg = f => base.reduce((a, k) => a + PRICES[k][f], 0) / base.length;
+  ESTIMATE = { ...P(avg('in'), avg('w5'), avg('w1'), avg('read'), avg('out')), from: base };
+}
+// Coste en USD por tipo de token (mismas claves que TOKEN_KEYS); null si el modelo no tiene tarifa
+function costParts(key, u) {
+  const p = priceFor(key);
+  if (!p) return null;
+  const w1 = u.cw1h || 0, w5 = (u.cache_creation_input_tokens || 0) - w1;
+  return {
+    input_tokens: (u.input_tokens || 0) * p.in / 1e6,
+    output_tokens: (u.output_tokens || 0) * p.out / 1e6,
+    cache_creation_input_tokens: (w5 * p.w5 + w1 * p.w1) / 1e6,
+    cache_read_input_tokens: (u.cache_read_input_tokens || 0) * p.read / 1e6,
+  };
+}
+// Coste en USD de un conjunto de modelos {modelo: uso}, solo con los tipos indicados
+const costOf = (models, keys = TOKEN_KEYS) => Object.entries(models || {}).reduce((a, [mo, u]) => {
+  const c = costParts(mo, u);
+  return c ? a + keys.reduce((s, k) => s + c[k], 0) : a;
+}, 0);
+const costOfDays = days => Object.values(days || {}).reduce((a, models) => a + costOf(models), 0);
+const unpricedModels = models => [...new Set(Object.keys(models || {}).filter(isEstimated).map(baseModel))];
+const estimatedNote = list => list.length
+  ? `<span>Tarifa estimada (promedio, ver tabla de precios): <b>${esc(list.join(', '))}</b></span>` : '';
+const fmtEur = e => e.toLocaleString('es-ES', { style: 'currency', currency: 'EUR',
+                      minimumFractionDigits: e < 10 ? 2 : 0, maximumFractionDigits: e < 10 ? 2 : 0 });
+const money = usd => fmtEur(usd / USD_PER_EUR);
+const pad2 = n => String(n).padStart(2, '0');
+const dayKey = ts => { const d = new Date(ts); return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`; };
+// Suma src (dia -> modelo -> uso) dentro de target
+function mergeDays(target, src) {
+  for (const [day, models] of Object.entries(src || {}))
+    for (const [model, u] of Object.entries(models)) {
+      const t = (target[day] ||= {})[model] ||= emptyUsage();
+      for (const k of USAGE_KEYS) t[k] += u[k] || 0;
+    }
+}
 
 function cacheGet(key) {
   try { return JSON.parse(localStorage.getItem(CACHE_PREFIX + key)); } catch { return null; }
@@ -165,7 +272,7 @@ async function parseTranscript(url) {
     } else if (o.type === 'assistant') {
       const m = o.message || {};
       if (!m.usage || m.model === '<synthetic>') return;
-      reqs.set(`${m.id}|${o.requestId}`, [m.model || '?', m.usage]); // la ultima linea manda
+      reqs.set(`${m.id}|${o.requestId}`, [m.model || '?', m.usage, o.timestamp]); // la ultima linea manda
     }
   };
 
@@ -181,12 +288,18 @@ async function parseTranscript(url) {
   }
   if (buf) onLine(buf);
 
-  const tokens = emptyUsage(), models = {};
-  for (const [model, u] of reqs.values()) {
+  const tokens = emptyUsage(), models = {}, days = {};   // days: dia local -> modelo -> uso
+  for (const [model0, u, ts] of reqs.values()) {
+    const model = priceKey(model0, u);
     const m = models[model] ||= emptyUsage();
-    for (const k of TOKEN_KEYS) { const v = +u[k] || 0; tokens[k] += v; m[k] += v; }
+    const d = ts ? ((days[dayKey(ts)] ||= {})[model] ||= emptyUsage()) : null;
+    const w1 = Math.min(+u.cache_creation?.ephemeral_1h_input_tokens || 0, +u.cache_creation_input_tokens || 0);
+    for (const k of USAGE_KEYS) {
+      const v = k === 'cw1h' ? w1 : +u[k] || 0;
+      tokens[k] += v; m[k] += v; if (d) d[k] += v;
+    }
   }
-  return { tokens, models, total: TOKEN_KEYS.reduce((a, k) => a + tokens[k], 0),
+  return { tokens, models, days, total: TOKEN_KEYS.reduce((a, k) => a + tokens[k], 0),
            requests: reqs.size, title, firstPrompt: firstPrompt || '', start, end };
 }
 
@@ -266,9 +379,13 @@ async function loadDetail(s) {
   }
   agents.sort((a, b) => (a.start || '').localeCompare(b.start || ''));
   // Actualiza el resumen de la sesion para el combo
+  const days = {};
+  mergeDays(days, main.days);
+  agents.forEach(a => mergeDays(days, a.days));
   Object.assign(s, { title: main.title || trunc(main.firstPrompt, 80), agents: agents.length,
-                     total: main.total + agents.reduce((a, x) => a + x.total, 0), done: true });
-  cacheSet('session:' + s.path, { mtime: s.mtime, data: { title: s.title, agents: s.agents, total: s.total } });
+                     total: main.total + agents.reduce((a, x) => a + x.total, 0), days, done: true });
+  cacheSet('session:' + s.path, { mtime: s.mtime, data: { title: s.title, agents: s.agents, total: s.total, days } });
+  scheduleDays();
   return { main, agents };
 }
 
@@ -277,7 +394,7 @@ function optionLabel(s, showProject) {
   const proj = showProject ? ` · ${prettyProject(s.project)}` : '';
   if (!s.done) return `${fmtDate(s.mtime)}${proj} · ${s.id.slice(0, 8)}… (analizando)`;
   const ag = s.agents ? ` · ${s.agents} agente${s.agents > 1 ? 's' : ''}` : '';
-  return `${fmtDate(s.mtime)}${proj} · ${trunc(s.title || s.id, 70)}${ag} · ${short(s.total)}`;
+  return `${fmtDate(s.mtime)}${proj} · ${trunc(s.title || s.id, 70)}${ag} · ${short(s.total)} · ${money(costOfDays(s.days))}`;
 }
 
 function fillProjects() {
@@ -325,6 +442,44 @@ async function backgroundScan() {
     try { await loadDetail(s); refreshOption(s); } catch { /* sigue */ }
   }
   $('status').textContent = `${sessions.length} sesiones`;
+  refreshPrices();
+  sessions.forEach(refreshOption);
+  render();
+  renderDays();
+}
+
+// Recalcula la tarifa estimada con los modelos vistos y redibuja la tabla de precios
+function refreshPrices() {
+  computeEstimate(sessions.flatMap(s => Object.values(s.days || {}).flatMap(Object.keys)));
+  renderPrices();
+}
+
+// Tabla de precios: modelos usados (con su origen: oficial o estimada) y, plegada, la tabla completa
+function renderPrices() {
+  const usd = v => v == null ? '—' : '$' + (+v.toFixed(4)).toLocaleString('es-ES', { maximumFractionDigits: 4 });
+  const used = {};
+  sessions.forEach(s => Object.values(s.days || {}).forEach(models => Object.entries(models).forEach(([k, u]) => {
+    const b = cleanModel(baseModel(k));
+    used[b] = (used[b] || 0) + TOKEN_KEYS.reduce((a, t) => a + (u[t] || 0), 0);
+  })));
+  const cells = p => `<td>${usd(p?.in)}</td><td>${usd(p?.w5)}</td><td>${usd(p?.w1)}</td><td>${usd(p?.read)}</td><td>${usd(p?.out)}</td>`;
+  const longCell = m => { const l = PRICES[m + '#long']; return `<td>${l ? `${usd(l.in)} / ${usd(l.out)}` : '—'}</td>`; };
+  const head = `<th>Modelo</th><th>Origen</th><th>Tokens usados</th><th>Entrada</th><th>Escritura caché 5 min</th>
+    <th>Escritura caché 1 h</th><th>Lectura caché</th><th>Salida</th><th>&gt; 100k (entrada / salida)</th>`;
+  const rows = Object.entries(used).sort((a, b) => b[1] - a[1]).map(([m, n]) => {
+    const p = PRICES[m];
+    return `<tr><td>${esc(m)}</td><td>${p ? 'oficial' : `estimada (promedio de ${esc((ESTIMATE?.from || []).join(', '))})`}</td>
+      <td>${fmt(n)}</td>${cells(p || ESTIMATE)}${p ? longCell(m) : '<td>—</td>'}</tr>`;
+  }).join('');
+  const all = Object.keys(PRICES).filter(k => !k.includes('#')).map(m =>
+    `<tr><td>${esc(m)}</td><td>oficial</td><td>${used[m] ? fmt(used[m]) : ''}</td>${cells(PRICES[m])}${longCell(m)}</tr>`).join('');
+  $('prices').innerHTML = `
+    <div class="meta" style="margin-bottom:10px"><span><b>Precios por modelo</b> · USD por millón de tokens ·
+      <a href="https://platform.claude.com/docs/en/about-claude/pricing" style="color:var(--accent)">fuente</a> (consultada el 2026-11-19) ·
+      1 € = ${USD_PER_EUR.toLocaleString('es-ES')} $ · es el coste equivalente de la API, no lo que cobra tu plan</span></div>
+    <table><thead><tr>${head}</tr></thead><tbody>${rows || '<tr><td class="empty">Sin datos.</td></tr>'}</tbody></table>
+    <details style="margin-top:12px"><summary style="cursor:pointer;color:var(--muted)">Ver todas las tarifas</summary>
+      <table><thead><tr>${head}</tr></thead><tbody>${all}</tbody></table></details>`;
 }
 
 async function init() {
@@ -332,28 +487,194 @@ async function init() {
   $('status').textContent = 'Buscando sesiones…';
   await loadConfig();
   sessions = await discover();
+  refreshPrices();
   fillProjects();
   fillSessions(keep);
   backgroundScan();
 }
 
 function modelsText(models) {
-  return Object.entries(models || {})
-    .map(([m, u]) => `${m} (${short(Object.values(u).reduce((a, b) => a + b, 0))})`).join(', ') || '—';
+  const by = {};
+  for (const [m, u] of Object.entries(models || {}))
+    by[baseModel(m)] = (by[baseModel(m)] || 0) + TOKEN_KEYS.reduce((a, k) => a + (u[k] || 0), 0);
+  return Object.entries(by).map(([m, n]) => `${m} (${short(n)})`).join(', ') || '—';
+}
+
+// Etiqueta sobre cada barra: icono, tokens y debajo el coste en euros
+function drawBarLabel(ctx, x, yTop, tokens, eurText, spark) {
+  const tokText = short(tokens), gap = 8;
+  const wTok = ctx.measureText(tokText).width, wEur = ctx.measureText(eurText).width;
+  const left = x - (wTok + gap + wEur) / 2;          // grupo "11 M  12 €" centrado sobre la barra
+  ctx.textAlign = 'left';
+  ctx.fillStyle = css('--text');
+  ctx.fillText(tokText, left, yTop - 6);
+  ctx.fillStyle = css('--c-money');
+  ctx.fillText(eurText, left + wTok + gap, yTop - 6);
+  ctx.textAlign = 'center';
+  if (spark) drawSpark(ctx, x, yTop - 28, 9, spark);
+}
+
+const BAR_W = 64, SLOT_W = 96;   // ancho maximo de barra y de su hueco (px)
+
+// Icono tipo "chispa" de Claude: rayos de longitud alterna desde un centro
+function drawSpark(ctx, x, y, r, color) {
+  const rays = 12;
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2.4;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  for (let i = 0; i < rays; i++) {
+    const a = (i / rays) * Math.PI * 2 - Math.PI / 2;
+    const len = r * (i % 2 ? 0.7 : 1);
+    ctx.moveTo(x + Math.cos(a) * r * 0.2, y + Math.sin(a) * r * 0.2);
+    ctx.lineTo(x + Math.cos(a) * len, y + Math.sin(a) * len);
+  }
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ---------- Pestanas ----------
+let tab = 'session', dayChart = null, daysTimer;
+const MODEL_COLORS = ['#d97757', '#7f98b0', '#c9a86a', '#6fc3a0', '#a78bda', '#d9708f', '#8aa84f', '#5fb3c9'];
+
+function setTab(name) {
+  tab = name;
+  document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
+  $('tab-session').hidden = name !== 'session';
+  $('tab-days').hidden = name !== 'days';
+  render();
+  renderDays();
+}
+function scheduleDays() {            // evita redibujar con cada sesion analizada en segundo plano
+  if (tab !== 'days') return;
+  clearTimeout(daysTimer);
+  daysTimer = setTimeout(renderDays, 300);
+}
+
+function renderDays() {
+  if (tab !== 'days') return;
+  const p = $('project').value, hide = $('hideCacheRead').checked, byModel = $('groupBy').value === 'model';
+  const types = TYPES.filter(t => !(hide && t.key === 'cache_read_input_tokens'));
+  const scope = sessions.filter(s => !p || s.project === p);
+  const days = {};
+  scope.forEach(s => mergeDays(days, s.days));
+  const keys = Object.keys(days).sort();
+  const pending = scope.filter(s => !s.done).length;
+  if (!keys.length) {
+    $('daysMeta').innerHTML = `<span class="empty">${pending ? 'Analizando sesiones…' : 'Sin datos.'}</span>`;
+    if (dayChart) { dayChart.destroy(); dayChart = null; }
+    return;
+  }
+
+  // Todos los dias del rango (los vacios cuentan como 0)
+  const range = [];
+  const [y, m, d0] = keys[0].split('-').map(Number);
+  for (let d = new Date(y, m - 1, d0); dayKey(d) <= keys[keys.length - 1]; d.setDate(d.getDate() + 1)) range.push(dayKey(d));
+
+  // Valores por modelo/uso: tokens, o coste en euros segun la metrica elegida
+  const asCost = $('metric').value === 'cost';
+  const entries = day => Object.entries(days[day] || {});
+  const tokOf = (mo, u) => types.reduce((a, t) => a + (u[t.key] || 0), 0);
+  const eurOf = (mo, u) => { const c = costParts(mo, u); return c ? types.reduce((a, t) => a + c[t.key], 0) / USD_PER_EUR : 0; };
+  const valT = (mo, u, t) => asCost ? (costParts(mo, u)?.[t.key] || 0) / USD_PER_EUR : (u[t.key] || 0);
+  const sumU = asCost ? eurOf : tokOf;
+  const tokTotals = range.map(day => entries(day).reduce((a, [mo, u]) => a + tokOf(mo, u), 0));
+  const eurTotals = range.map(day => entries(day).reduce((a, [mo, u]) => a + eurOf(mo, u), 0));
+  const totals = asCost ? eurTotals : tokTotals;
+  const fmtV = asCost ? fmtEur : fmt;
+  const axisV = asCost ? v => fmtEur(v) : short;
+
+  let datasets;
+  if (byModel) {
+    const tm = {};
+    range.forEach(day => entries(day).forEach(([mo, u]) => { tm[baseModel(mo)] = (tm[baseModel(mo)] || 0) + sumU(mo, u); }));
+    datasets = Object.keys(tm).sort((a, b) => tm[b] - tm[a]).map((bm, i) => ({
+      label: bm, backgroundColor: MODEL_COLORS[i % MODEL_COLORS.length],
+      data: range.map(day => entries(day).filter(([mo]) => baseModel(mo) === bm).reduce((a, [mo, u]) => a + sumU(mo, u), 0)),
+    }));
+  } else {
+    datasets = types.map(t => ({
+      label: t.label, backgroundColor: css(t.color),
+      data: range.map(day => entries(day).reduce((a, [mo, u]) => a + valT(mo, u, t), 0)),
+    }));
+  }
+  datasets.forEach(ds => Object.assign(ds, { stack: 's', borderRadius: 2, maxBarThickness: 48 }));
+
+  const grandTok = tokTotals.reduce((a, b) => a + b, 0), grandEur = eurTotals.reduce((a, b) => a + b, 0);
+  const active = tokTotals.filter(t => t > 0).length;
+  const unpriced = unpricedModels(Object.assign({}, ...Object.values(days).map(d => d)));
+  $('daysMeta').innerHTML = `
+    <span>Periodo: <b>${esc(range[0])}</b> → <b>${esc(range[range.length - 1])}</b></span>
+    <span>Días con actividad: <b>${active}</b></span>
+    <span>Total tokens${hide ? ' (sin lectura de caché)' : ''}: <b>${fmt(grandTok)}</b></span>
+    <span>Coste estimado: <b class="money">${fmtEur(grandEur)}</b></span>
+    <span>Media por día activo: <b>${fmt(Math.round(grandTok / Math.max(active, 1)))}</b> · <b class="money">${fmtEur(grandEur / Math.max(active, 1))}</b></span>
+    <span>Sesiones: <b>${scope.length - pending}</b>${pending ? ` (analizando ${pending} más…)` : ''}</span>
+    ${estimatedNote(unpriced)}`;
+
+  const label = day => `${day.slice(8)}/${day.slice(5, 7)}`;
+  const totalsPlugin = {
+    id: 'dayTotals',
+    afterDatasetsDraw(c) {
+      if (range.length > 31) return;
+      const { ctx } = c, metas = c.data.datasets.map((_, i) => c.getDatasetMeta(i)).filter(mm => !mm.hidden);
+      ctx.save(); ctx.font = '600 11px system-ui, sans-serif'; ctx.textAlign = 'center';
+      range.forEach((_, i) => {
+        if (!tokTotals[i]) return;
+        const els = metas.map(mm => mm.data[i]).filter(Boolean);
+        if (els.length) drawBarLabel(ctx, els[0].x, Math.min(...els.map(e => e.y)), tokTotals[i], fmtEur(eurTotals[i]));
+      });
+      ctx.restore();
+    },
+  };
+
+  if (dayChart) dayChart.destroy();
+  dayChart = new Chart($('dayChart'), {
+    type: 'bar',
+    data: { labels: range.map(label), datasets },
+    plugins: [totalsPlugin],
+    options: {
+      maintainAspectRatio: false,
+      layout: { padding: { top: 24 } },
+      interaction: { mode: 'index', intersect: false },
+      scales: {
+        x: { stacked: true, grid: { display: false }, ticks: { color: css('--muted'), maxRotation: 60, autoSkip: true } },
+        y: { stacked: true, grid: { color: css('--border') }, ticks: { color: css('--muted'), callback: v => axisV(v) } },
+      },
+      plugins: {
+        legend: { labels: { color: css('--text') } },
+        tooltip: {
+          filter: it => it.raw > 0,
+          callbacks: {
+            title: items => new Date(range[items[0].dataIndex] + 'T00:00').toLocaleDateString('es-ES',
+              { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }),
+            label: it => `${it.dataset.label}: ${fmtV(it.raw)}`,
+            footer: items => [`Total: ${fmt(tokTotals[items[0].dataIndex])} tokens`,
+                              `Coste estimado: ${fmtEur(eurTotals[items[0].dataIndex])}`],
+          },
+        },
+      },
+    },
+  });
 }
 
 function render() {
-  if (!current) return;
+  if (!current || tab !== 'session') return;
   const { s, main, agents } = current;
   const hide = $('hideCacheRead').checked;
   const types = TYPES.filter(t => !(hide && t.key === 'cache_read_input_tokens'));
   const bars = [
     { label: 'Sesión principal', full: main.title || trunc(main.firstPrompt, 120) || 'Sesión principal',
-      kind: 'principal', ...main },
+      kind: 'principal', isMain: true, ...main },
     ...agents.map(a => ({ label: trunc(a.description, 42), full: a.description,
       kind: (a.agentType || 'agente') + (a.depth > 1 ? ` (nivel ${a.depth})` : ''), ...a })),
   ];
   const sumAll = bars.reduce((a, b) => a + b.total, 0);
+  const typeKeys = types.map(t => t.key);
+  bars.forEach(b => { b.cost = costOf(b.models); b.shownCost = costOf(b.models, typeKeys); });
+  const costAll = bars.reduce((a, b) => a + b.cost, 0);
+  const unpriced = unpricedModels(Object.assign({}, ...bars.map(b => b.models)));
 
   $('meta').innerHTML = `
     <span>Sesión: <b>${esc(main.title || s.id)}</b></span>
@@ -362,12 +683,20 @@ function render() {
     <span>Fin: <b>${esc(fmtDate(main.end))}</b></span>
     <span>Subagentes: <b>${agents.length}</b></span>
     <span>Total tokens (principal + agentes): <b>${fmt(sumAll)}</b></span>
+    <span>Coste estimado: <b class="money">${money(costAll)}</b></span>
+    ${estimatedNote(unpriced)}
     <span>Id: <b>${esc(s.id)}</b></span>`;
 
   const datasets = types.map(t => ({
-    label: t.label, backgroundColor: css(t.color), stack: 's', borderRadius: 2, maxBarThickness: 64,
+    label: t.label, backgroundColor: css(t.color), stack: 's', borderRadius: 2,
+    maxBarThickness: BAR_W, categoryPercentage: 0.8, barPercentage: 0.9,
     data: bars.map(b => b.tokens[t.key]),
   }));
+
+  // Las barras tienen un ancho fijo y empiezan por la izquierda: se reservan "huecos" vacios
+  // (etiquetas '') hasta rellenar el ancho del grafico.
+  const slots = Math.max(bars.length, Math.floor($('chart').parentElement.clientWidth / SLOT_W));
+  const labels = bars.map(b => b.label).concat(Array(slots - bars.length).fill(''));
 
   const totalsPlugin = {
     id: 'totals',
@@ -375,15 +704,15 @@ function render() {
       const { ctx } = c;
       const metas = c.data.datasets.map((_, i) => c.getDatasetMeta(i)).filter(m => !m.hidden);
       ctx.save();
-      ctx.fillStyle = css('--text');
       ctx.font = '600 11px system-ui, sans-serif';
       ctx.textAlign = 'center';
       bars.forEach((b, i) => {
         const tops = metas.map(m => m.data[i]).filter(Boolean);
         if (!tops.length) return;
         const y = Math.min(...tops.map(el => el.y));
+        const x = tops[0].x;
         const shown = types.reduce((a, t) => a + b.tokens[t.key], 0);
-        ctx.fillText(short(shown), tops[0].x, y - 6);
+        drawBarLabel(ctx, x, y, shown, money(b.shownCost), b.isMain ? css('--c-main') : css('--c-agent'));
       });
       ctx.restore();
     },
@@ -392,11 +721,11 @@ function render() {
   if (chart) chart.destroy();
   chart = new Chart($('chart'), {
     type: 'bar',
-    data: { labels: bars.map(b => b.label), datasets },
+    data: { labels, datasets },
     plugins: [totalsPlugin],
     options: {
       maintainAspectRatio: false,
-      layout: { padding: { top: 20 } },
+      layout: { padding: { top: 44 } },
       scales: {
         x: { stacked: true, grid: { display: false },
              ticks: { color: css('--muted'), maxRotation: 45, minRotation: 45, autoSkip: false } },
@@ -412,7 +741,8 @@ function render() {
             afterBody: items => {
               const b = bars[items[0].dataIndex];
               return [`Tipo: ${b.kind}`, `Modelo: ${modelsText(b.models)}`,
-                      `Peticiones: ${b.requests}`, `Total: ${fmt(b.total)}`];
+                      `Peticiones: ${b.requests}`, `Total: ${fmt(b.total)}`,
+                      `Coste estimado: ${money(b.cost)}`];
             },
           },
         },
@@ -422,18 +752,29 @@ function render() {
 
   const head = TYPES.map(t => `<th><span class="swatch" style="background:${css(t.color)}"></span>${t.label}</th>`).join('');
   $('detail').innerHTML = `<table>
-    <thead><tr><th>Barra</th><th>Tipo</th><th>Modelo</th>${head}<th>Total</th><th>Peticiones</th></tr></thead>
+    <thead><tr><th>Barra</th><th>Tipo</th><th>Modelo</th>${head}<th>Total</th><th>Coste est.</th><th>Peticiones</th></tr></thead>
     <tbody>${bars.map((b, i) => `<tr class="${i ? '' : 'main'}">
       <td class="desc" title="${esc(b.full)}">${esc(b.full)}</td><td>${esc(b.kind)}</td><td>${esc(modelsText(b.models))}</td>
       ${TYPES.map(t => `<td>${fmt(b.tokens[t.key])}</td>`).join('')}
-      <td><b>${fmt(b.total)}</b></td><td>${b.requests}</td></tr>`).join('')}</tbody></table>`;
+      <td><b>${fmt(b.total)}</b></td><td><b class="money">${money(b.cost)}</b></td><td>${b.requests}</td></tr>`).join('')}</tbody></table>`;
 }
 
-$('project').addEventListener('change', () => fillSessions());
+document.querySelectorAll('.tabs button').forEach(b => b.addEventListener('click', () => setTab(b.dataset.tab)));
+$('groupBy').addEventListener('change', renderDays);
+$('metric').addEventListener('change', renderDays);
+$('project').addEventListener('change', () => { fillSessions(); renderDays(); });
 $('session').addEventListener('change', showSession);
-$('hideCacheRead').addEventListener('change', render);
+$('hideCacheRead').addEventListener('change', () => { render(); renderDays(); });
 $('reload').addEventListener('click', init);
-window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', render);
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { render(); renderDays(); });
+let lastW = 0, resizeTimer;
+window.addEventListener('resize', () => {   // recalcula los huecos de barras al cambiar el ancho
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    const w = $('chart').parentElement.clientWidth;
+    if (Math.abs(w - lastW) > SLOT_W / 2) { lastW = w; render(); }
+  }, 200);
+});
 init().catch(e => { $('meta').innerHTML = `<span class="empty">Error: ${esc(e.message)}</span>`; });
 </script>
 </body>
