@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Monitor</title>
+<!--
+  Claude Monitor: consumo de tokens de Claude Code por sesion y subagente.
+  Todo se calcula aqui en el navegador. El servidor es estatico (python -m http.server)
+  y "claude-projects" es una union (junction) a C:\Users\<usuario>\.claude\projects.
+-->
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0a0a0a; --panel: #141414; --text: #e6e1d9; --muted: #8a8580; --border: #2a2826;
+    --accent: #d97757;
+    --c-input: #7f98b0; --c-output: #d97757; --c-cwrite: #c9a86a; --c-cread: #5a5650;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 13px/1.5 ui-monospace, "Cascadia Code", "SF Mono", Consolas, Menlo, monospace; }
+  header { padding: 14px 20px; border-bottom: 1px solid var(--border); background: var(--panel);
+           display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: flex-end; }
+  h1 { font-size: 15px; margin: 0 12px 4px 0; color: var(--accent); font-weight: 600; }
+  h1::before { content: "❯ "; }
+  label { color: var(--muted); font-size: 12px; display: flex; flex-direction: column; gap: 3px; }
+  select { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--border);
+           border-radius: 4px; padding: 6px 8px; max-width: 100%; }
+  #session { min-width: min(640px, 90vw); }
+  .check { flex-direction: row; align-items: center; gap: 6px; font-size: 13px; color: var(--text); padding-bottom: 6px; }
+  button:hover, select:focus { border-color: var(--accent); outline: none; }
+  input[type=checkbox] { accent-color: var(--accent); }
+  button { font: inherit; padding: 6px 12px; border-radius: 4px; border: 1px solid var(--border);
+           background: var(--bg); color: var(--text); cursor: pointer; }
+  #status { color: var(--muted); font-size: 12px; padding-bottom: 8px; }
+  main { padding: 16px 20px 32px; display: grid; gap: 16px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; }
+  .meta { display: flex; flex-wrap: wrap; gap: 6px 22px; color: var(--muted); }
+  .meta b { color: var(--text); font-weight: 600; }
+  .chart-wrap { position: relative; height: 520px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 6px 8px; border-bottom: 1px solid var(--border); text-align: right; white-space: nowrap; }
+  th:nth-child(-n+3), td:nth-child(-n+3) { text-align: left; }
+  td.desc { white-space: normal; max-width: 420px; }
+  th { color: var(--muted); font-weight: 600; }
+  tr.main td { font-weight: 600; }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; }
+  .empty { color: var(--muted); }
+  .table-scroll { overflow-x: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Claude Monitor</h1>
+  <label>Proyecto
+    <select id="project"><option value="">Todos</option></select>
+  </label>
+  <label>Sesión
+    <select id="session"></select>
+  </label>
+  <label class="check"><input type="checkbox" id="hideCacheRead"> Ocultar lectura de caché</label>
+  <button id="reload" title="Volver a leer los transcripts">Recargar</button>
+  <span id="status"></span>
+</header>
+<main>
+  <div class="card meta" id="meta"><span class="empty">Cargando sesiones…</span></div>
+  <div class="card"><div class="chart-wrap"><canvas id="chart"></canvas></div></div>
+  <div class="card table-scroll" id="detail"></div>
+</main>
+
+<script src="vendor/chart.umd.min.js"></script>
+<script>
+// ---------- Configuracion ----------
+const DATA = 'claude-projects/';                 // junction a ~/.claude/projects
+// Valores por defecto; se sobrescriben con config.json (ver loadConfig)
+let PROJECT_PREFIXES = ['*'];                      // carpetas de ~/.claude/projects incluidas ('*' = todas)
+let PROJECT_NAMES = {};                            // carpeta de ~/.claude/projects -> nombre a mostrar
+
+// Claude Code nombra la carpeta de cada proyecto cambiando todo lo que no sea letra o
+// numero por '-':  C:\DESARROLLO\_TDCP  ->  C--DESARROLLO--TDCP
+const toClaudeDir = path => String(path).trim().replace(/[\\/]+$/, '').replace(/[^a-zA-Z0-9]/g, '-').toLowerCase();
+
+// La carpeta del propio proyecto o cualquiera de sus subcarpetas
+const includedProject = name => {
+  const n = name.toLowerCase();
+  return PROJECT_PREFIXES.some(p => p === '*' || n === p || n.startsWith(p + '-'));
+};
+
+async function loadConfig() {
+  try {
+    const cfg = await (await fetch('config.json', { cache: 'no-store' })).json();
+    if (Array.isArray(cfg.folders) && cfg.folders.length)
+      PROJECT_PREFIXES = cfg.folders.map(f => (f === '*' ? '*' : toClaudeDir(f)));
+    if (cfg.names && typeof cfg.names === 'object')
+      PROJECT_NAMES = Object.fromEntries(Object.entries(cfg.names).map(([k, v]) => [toClaudeDir(k), v]));
+  } catch { /* sin config.json o JSON invalido: valores por defecto */ }
+}
+const CACHE_PREFIX = 'cm1:';                      // cache de resumenes en localStorage
+
+const TOKEN_KEYS = ['input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens'];
+const TYPES = [
+  { key: 'input_tokens', label: 'Entrada', color: '--c-input' },
+  { key: 'output_tokens', label: 'Salida', color: '--c-output' },
+  { key: 'cache_creation_input_tokens', label: 'Escritura caché', color: '--c-cwrite' },
+  { key: 'cache_read_input_tokens', label: 'Lectura caché', color: '--c-cread' },
+];
+
+// ---------- Utilidades ----------
+const $ = id => document.getElementById(id);
+const fmt = n => (n || 0).toLocaleString('es-ES');
+const short = n => n >= 1e6 ? (n / 1e6).toFixed(1).replace('.', ',') + ' M'
+                 : n >= 1e3 ? Math.round(n / 1e3) + ' k' : String(n || 0);
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+const fmtDate = s => s ? new Date(s).toLocaleString('es-ES', { dateStyle: 'short', timeStyle: 'short' }) : '';
+const trunc = (s, n) => s && s.length > n ? s.slice(0, n - 1) + '…' : (s || '');
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const prettyProject = p => PROJECT_NAMES[p.toLowerCase()] || p.replace(/^[a-z]--DESARROLLO--/i, '');
+const emptyUsage = () => Object.fromEntries(TOKEN_KEYS.map(k => [k, 0]));
+
+function cacheGet(key) {
+  try { return JSON.parse(localStorage.getItem(CACHE_PREFIX + key)); } catch { return null; }
+}
+function cacheSet(key, val) {
+  try { localStorage.setItem(CACHE_PREFIX + key, JSON.stringify(val)); } catch { /* sin cache */ }
+}
+
+// Listado de directorio de python http.server -> [{name, dir}]
+async function listDir(url) {
+  const res = await fetch(url, { cache: 'no-store' });
+  if (!res.ok) return [];
+  const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
+  return [...doc.querySelectorAll('li > a')].map(a => {
+    const href = decodeURIComponent(a.getAttribute('href'));
+    return { name: href.replace(/\/$/, ''), dir: href.endsWith('/') };
+  });
+}
+
+async function headInfo(url) {
+  const res = await fetch(url, { method: 'HEAD', cache: 'no-store' });
+  return { mtime: res.headers.get('Last-Modified') || '', size: res.headers.get('Content-Length') || '' };
+}
+
+// Lee un .jsonl en streaming y resume tokens por modelo (deduplicando por message.id + requestId)
+async function parseTranscript(url) {
+  const res = await fetch(url, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`${res.status} ${url}`);
+  const reqs = new Map();
+  let title = null, firstPrompt = null, start = null, end = null;
+
+  const onLine = line => {
+    const isAssistant = line.includes('"type":"assistant"');
+    const isTitle = line.includes('"type":"ai-title"');
+    const isUser = firstPrompt === null && line.includes('"type":"user"');
+    if (!isAssistant && !isTitle && !isUser) return;
+    let o; try { o = JSON.parse(line); } catch { return; }
+    if (o.timestamp) {
+      if (!start || o.timestamp < start) start = o.timestamp;
+      if (!end || o.timestamp > end) end = o.timestamp;
+    }
+    if (o.type === 'ai-title' && o.aiTitle) title = o.aiTitle;
+    else if (o.type === 'user' && firstPrompt === null && !o.isMeta) {
+      const c = o.message?.content;
+      const t = (typeof c === 'string' ? c : (Array.isArray(c) ? (c.find(b => b?.type === 'text')?.text || '') : '')).trim();
+      if (t && !t.startsWith('<')) firstPrompt = t.slice(0, 300);
+    } else if (o.type === 'assistant') {
+      const m = o.message || {};
+      if (!m.usage || m.model === '<synthetic>') return;
+      reqs.set(`${m.id}|${o.requestId}`, [m.model || '?', m.usage]); // la ultima linea manda
+    }
+  };
+
+  const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+  let buf = '';
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += value;
+    const parts = buf.split('\n');
+    buf = parts.pop();
+    parts.forEach(onLine);
+  }
+  if (buf) onLine(buf);
+
+  const tokens = emptyUsage(), models = {};
+  for (const [model, u] of reqs.values()) {
+    const m = models[model] ||= emptyUsage();
+    for (const k of TOKEN_KEYS) { const v = +u[k] || 0; tokens[k] += v; m[k] += v; }
+  }
+  return { tokens, models, total: TOKEN_KEYS.reduce((a, k) => a + tokens[k], 0),
+           requests: reqs.size, title, firstPrompt: firstPrompt || '', start, end };
+}
+
+// Resumen con cache: solo se vuelve a leer si cambia fecha o tamano del fichero
+async function summary(path) {
+  const info = await headInfo(path);
+  const hit = cacheGet(path);
+  if (hit && hit.mtime === info.mtime && hit.size === info.size) return hit.data;
+  const data = await parseTranscript(path);
+  cacheSet(path, { ...info, data });
+  return data;
+}
+
+// ---------- Modelo de sesiones ----------
+let sessions = [];      // {project, id, path, dirPath, hasDir, mtime, title, agents, total, done}
+let current = null;
+let chart = null;
+let scanToken = 0;
+
+async function discover() {
+  const projects = (await listDir(DATA))
+    .filter(e => e.dir && includedProject(e.name))
+    .map(e => e.name);
+  const found = [];
+  for (const project of projects) {
+    const entries = await listDir(`${DATA}${encodeURIComponent(project)}/`);
+    const dirs = new Set(entries.filter(e => e.dir).map(e => e.name));
+    for (const e of entries) {
+      if (e.dir || !e.name.endsWith('.jsonl')) continue;
+      const id = e.name.slice(0, -6);
+      found.push({
+        project, id,
+        path: `${DATA}${encodeURIComponent(project)}/${encodeURIComponent(e.name)}`,
+        dirPath: `${DATA}${encodeURIComponent(project)}/${encodeURIComponent(id)}/`,
+        hasDir: dirs.has(id),
+      });
+    }
+  }
+  // Fecha de modificacion de cada sesion (HEAD), con concurrencia limitada
+  await pool(found, 12, async s => {
+    s.mtime = (await headInfo(s.path)).mtime;
+    const hit = cacheGet('session:' + s.path);
+    if (hit && hit.mtime === s.mtime) Object.assign(s, hit.data, { done: true });
+  });
+  found.sort((a, b) => new Date(b.mtime) - new Date(a.mtime));
+  return found;
+}
+
+async function pool(items, n, fn) {
+  let i = 0;
+  await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => {
+    while (i < items.length) { const it = items[i++]; try { await fn(it); } catch { /* sigue */ } }
+  }));
+}
+
+async function agentFiles(s) {
+  if (!s.hasDir) return [];
+  const sub = `${s.dirPath}subagents/`;
+  return (await listDir(sub))
+    .filter(e => !e.dir && /^agent-.*\.jsonl$/.test(e.name))
+    .map(e => ({ name: e.name, path: sub + encodeURIComponent(e.name),
+                 metaPath: sub + encodeURIComponent(e.name.replace(/\.jsonl$/, '.meta.json')) }));
+}
+
+async function loadDetail(s) {
+  const main = await summary(s.path);
+  const files = await agentFiles(s);
+  const agents = [];
+  for (const f of files) {
+    try {
+      const data = await summary(f.path);
+      let meta = {};
+      try { meta = await (await fetch(f.metaPath, { cache: 'no-store' })).json(); } catch { /* sin meta */ }
+      agents.push({ ...data, description: meta.description || trunc(data.firstPrompt, 60) || f.name,
+                    agentType: meta.agentType, depth: meta.spawnDepth || 1 });
+    } catch { /* fichero ilegible */ }
+  }
+  agents.sort((a, b) => (a.start || '').localeCompare(b.start || ''));
+  // Actualiza el resumen de la sesion para el combo
+  Object.assign(s, { title: main.title || trunc(main.firstPrompt, 80), agents: agents.length,
+                     total: main.total + agents.reduce((a, x) => a + x.total, 0), done: true });
+  cacheSet('session:' + s.path, { mtime: s.mtime, data: { title: s.title, agents: s.agents, total: s.total } });
+  return { main, agents };
+}
+
+// ---------- UI ----------
+function optionLabel(s, showProject) {
+  const proj = showProject ? ` · ${prettyProject(s.project)}` : '';
+  if (!s.done) return `${fmtDate(s.mtime)}${proj} · ${s.id.slice(0, 8)}… (analizando)`;
+  const ag = s.agents ? ` · ${s.agents} agente${s.agents > 1 ? 's' : ''}` : '';
+  return `${fmtDate(s.mtime)}${proj} · ${trunc(s.title || s.id, 70)}${ag} · ${short(s.total)}`;
+}
+
+function fillProjects() {
+  const sel = $('project'), keep = sel.value;
+  const projects = [...new Set(sessions.map(s => s.project))].sort();
+  sel.innerHTML = '<option value="">Todos</option>' +
+    projects.map(p => `<option value="${esc(p)}">${esc(prettyProject(p))}</option>`).join('');
+  sel.value = projects.includes(keep) ? keep : '';
+}
+
+function fillSessions(keep) {
+  const p = $('project').value;
+  const list = sessions.filter(s => !p || s.project === p);
+  $('session').innerHTML = list.map(s =>
+    `<option value="${esc(s.path)}">${esc(optionLabel(s, !p))}</option>`).join('');
+  if (!list.length) { $('meta').innerHTML = '<span class="empty">No hay sesiones.</span>'; return; }
+  if (keep && list.some(s => s.path === keep)) $('session').value = keep;
+  showSession();
+}
+
+function refreshOption(s) {
+  const opt = [...$('session').options].find(o => o.value === s.path);
+  if (opt) opt.textContent = optionLabel(s, !$('project').value);
+}
+
+async function showSession() {
+  const s = sessions.find(x => x.path === $('session').value);
+  if (!s) return;
+  $('meta').innerHTML = '<span class="empty">Leyendo sesión…</span>';
+  const detail = await loadDetail(s);
+  refreshOption(s);
+  if ($('session').value !== s.path) return; // el usuario cambio mientras tanto
+  current = { s, ...detail };
+  render();
+}
+
+// Rellena en segundo plano titulos y totales de las sesiones aun no analizadas
+async function backgroundScan() {
+  const token = ++scanToken;
+  const pending = sessions.filter(s => !s.done);
+  let n = 0;
+  for (const s of pending) {
+    if (token !== scanToken) return;
+    $('status').textContent = `Analizando sesiones ${++n}/${pending.length}…`;
+    try { await loadDetail(s); refreshOption(s); } catch { /* sigue */ }
+  }
+  $('status').textContent = `${sessions.length} sesiones`;
+}
+
+async function init() {
+  const keep = $('session').value;
+  $('status').textContent = 'Buscando sesiones…';
+  await loadConfig();
+  sessions = await discover();
+  fillProjects();
+  fillSessions(keep);
+  backgroundScan();
+}
+
+function modelsText(models) {
+  return Object.entries(models || {})
+    .map(([m, u]) => `${m} (${short(Object.values(u).reduce((a, b) => a + b, 0))})`).join(', ') || '—';
+}
+
+function render() {
+  if (!current) return;
+  const { s, main, agents } = current;
+  const hide = $('hideCacheRead').checked;
+  const types = TYPES.filter(t => !(hide && t.key === 'cache_read_input_tokens'));
+  const bars = [
+    { label: 'Sesión principal', full: main.title || trunc(main.firstPrompt, 120) || 'Sesión principal',
+      kind: 'principal', ...main },
+    ...agents.map(a => ({ label: trunc(a.description, 42), full: a.description,
+      kind: (a.agentType || 'agente') + (a.depth > 1 ? ` (nivel ${a.depth})` : ''), ...a })),
+  ];
+  const sumAll = bars.reduce((a, b) => a + b.total, 0);
+
+  $('meta').innerHTML = `
+    <span>Sesión: <b>${esc(main.title || s.id)}</b></span>
+    <span>Proyecto: <b>${esc(prettyProject(s.project))}</b></span>
+    <span>Inicio: <b>${esc(fmtDate(main.start))}</b></span>
+    <span>Fin: <b>${esc(fmtDate(main.end))}</b></span>
+    <span>Subagentes: <b>${agents.length}</b></span>
+    <span>Total tokens (principal + agentes): <b>${fmt(sumAll)}</b></span>
+    <span>Id: <b>${esc(s.id)}</b></span>`;
+
+  const datasets = types.map(t => ({
+    label: t.label, backgroundColor: css(t.color), stack: 's', borderRadius: 2, maxBarThickness: 64,
+    data: bars.map(b => b.tokens[t.key]),
+  }));
+
+  const totalsPlugin = {
+    id: 'totals',
+    afterDatasetsDraw(c) {
+      const { ctx } = c;
+      const metas = c.data.datasets.map((_, i) => c.getDatasetMeta(i)).filter(m => !m.hidden);
+      ctx.save();
+      ctx.fillStyle = css('--text');
+      ctx.font = '600 11px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      bars.forEach((b, i) => {
+        const tops = metas.map(m => m.data[i]).filter(Boolean);
+        if (!tops.length) return;
+        const y = Math.min(...tops.map(el => el.y));
+        const shown = types.reduce((a, t) => a + b.tokens[t.key], 0);
+        ctx.fillText(short(shown), tops[0].x, y - 6);
+      });
+      ctx.restore();
+    },
+  };
+
+  if (chart) chart.destroy();
+  chart = new Chart($('chart'), {
+    type: 'bar',
+    data: { labels: bars.map(b => b.label), datasets },
+    plugins: [totalsPlugin],
+    options: {
+      maintainAspectRatio: false,
+      layout: { padding: { top: 20 } },
+      scales: {
+        x: { stacked: true, grid: { display: false },
+             ticks: { color: css('--muted'), maxRotation: 45, minRotation: 45, autoSkip: false } },
+        y: { stacked: true, grid: { color: css('--border') },
+             ticks: { color: css('--muted'), callback: v => short(v) } },
+      },
+      plugins: {
+        legend: { labels: { color: css('--text') } },
+        tooltip: {
+          callbacks: {
+            title: items => bars[items[0].dataIndex].full,
+            label: it => `${it.dataset.label}: ${fmt(it.raw)}`,
+            afterBody: items => {
+              const b = bars[items[0].dataIndex];
+              return [`Tipo: ${b.kind}`, `Modelo: ${modelsText(b.models)}`,
+                      `Peticiones: ${b.requests}`, `Total: ${fmt(b.total)}`];
+            },
+          },
+        },
+      },
+    },
+  });
+
+  const head = TYPES.map(t => `<th><span class="swatch" style="background:${css(t.color)}"></span>${t.label}</th>`).join('');
+  $('detail').innerHTML = `<table>
+    <thead><tr><th>Barra</th><th>Tipo</th><th>Modelo</th>${head}<th>Total</th><th>Peticiones</th></tr></thead>
+    <tbody>${bars.map((b, i) => `<tr class="${i ? '' : 'main'}">
+      <td class="desc" title="${esc(b.full)}">${esc(b.full)}</td><td>${esc(b.kind)}</td><td>${esc(modelsText(b.models))}</td>
+      ${TYPES.map(t => `<td>${fmt(b.tokens[t.key])}</td>`).join('')}
+      <td><b>${fmt(b.total)}</b></td><td>${b.requests}</td></tr>`).join('')}</tbody></table>`;
+}
+
+$('project').addEventListener('change', () => fillSessions());
+$('session').addEventListener('change', showSession);
+$('hideCacheRead').addEventListener('change', render);
+$('reload').addEventListener('click', init);
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', render);
+init().catch(e => { $('meta').innerHTML = `<span class="empty">Error: ${esc(e.message)}</span>`; });
+</script>
+</body>
+</html>
