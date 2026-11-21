@@ -62,6 +62,27 @@ Vale cualquier servidor estático que genere listados de directorio con el forma
 - Tabla de **precios por modelo** al final de la página. Los modelos sin tarifa publicada usan una tarifa estimada: el promedio de los modelos con precio que aparecen en tus datos.
 - Filtro por proyecto y sesión, y opción de ocultar la lectura de caché.
 
+## Cómo se cuentan los tokens
+
+Cada respuesta del modelo aparece en varias líneas del transcript, una por bloque de contenido. Se cuenta una sola vez, por `message.id` + `requestId`, y se usa la última línea, que trae la salida final. Los subagentes tienen su propio transcript y sus mensajes no se repiten en el principal.
+
+Cada tipo de token se cobra a su tarifa:
+
+| Tipo | Tarifa |
+|---|---|
+| Entrada | entrada |
+| Salida | salida |
+| Escritura de caché de 5 min | 1,25 × entrada |
+| Escritura de caché de 1 h | 2 × entrada (se separa con `cache_creation.ephemeral_1h_input_tokens`) |
+| Lectura de caché | 0,1 × entrada aprox. (0,05 × en Opus 5.5) |
+
+La lectura de caché es casi siempre la mayor parte de los tokens, pero una parte pequeña del coste. Haiku 5.5 pasa a su tarifa larga en las peticiones de más de 100.000 tokens de prompt, petición a petición. No se contemplan el modo rápido (`speed: "fast"`) ni las búsquedas web, que tienen recargo.
+
+### Límites conocidos
+
+- **Sesiones retomadas o bifurcadas.** La sesión nueva copia el historial de la anterior, y las peticiones copiadas se suman en las dos. En la pestaña *En el tiempo* eso infla el total en torno a un 1 %: medido el 2026-11-21, 142 de 14.456 peticiones, unos 19 M de 1.766 M de tokens y unos 9 € de 705 €. Se asume este error.
+- **Historial limitado.** Claude Code borra los transcripts con más de 30 días (`cleanupPeriodDays`), así que el monitor no ve nada anterior. Para conservar más, pon por ejemplo `"cleanupPeriodDays": 365` en `~/.claude/settings.json`.
+
 ## Privacidad
 
 `claude-projects` y `config.json` están en `.gitignore`: contienen tus conversaciones y rutas locales y no deben subirse.
